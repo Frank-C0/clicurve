@@ -13,6 +13,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::path::PathBuf;
+use std::time::Duration;
 use store::MultiStore;
 
 #[derive(Parser)]
@@ -32,6 +33,14 @@ struct Cli {
     /// List available experiments and metrics, then exit (no TUI)
     #[arg(long)]
     list: bool,
+
+    /// Start with auto-rotate enabled
+    #[arg(long)]
+    auto_rotate: bool,
+
+    /// Auto-rotate interval in seconds (1-60)
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=60))]
+    rotate_interval: u64,
 }
 
 fn main() -> Result<()> {
@@ -72,7 +81,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut app = App::new(store, dir);
+    let mut app = App::new(
+        store,
+        dir,
+        cli.auto_rotate,
+        Duration::from_secs(cli.rotate_interval),
+    );
     if let Some(f) = cli.filter {
         app.filter = f;
         app.filter_mode = false;

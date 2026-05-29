@@ -36,6 +36,9 @@ clicurve /path/to/xps/ --list
 
 # Pre-filter metrics and start with log scale
 clicurve /path/to/xps/ -f "train/ce" -l
+
+# Start in auto-rotate mode with a custom interval
+clicurve /path/to/xps/ --auto-rotate --rotate-interval 10
 ```
 
 ## Keybindings
@@ -50,6 +53,9 @@ clicurve /path/to/xps/ -f "train/ce" -l
 | `s` / `S` | Decrease / increase EMA smoothing |
 | `l` | Toggle log scale |
 | `t` | Toggle X-axis between step and wall-clock time |
+| `R` | Toggle auto-rotate mode |
+| `+` / `=` | Increase auto-rotate interval |
+| `-` | Decrease auto-rotate interval |
 | `a` | Select / deselect all |
 | `r` | Reload data from disk |
 | `q` | Quit |

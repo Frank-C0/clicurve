@@ -30,6 +30,9 @@ const EXP_COLORS: &[Color] = &[
     Color::LightMagenta,
 ];
 
+const ROTATE_MIN_SECS: u64 = 1;
+const ROTATE_MAX_SECS: u64 = 60;
+
 /// Which panel has focus.
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
@@ -80,6 +83,16 @@ pub struct App {
     pub wall_time_axis: bool,
     /// EMA smoothing factor (0.0 = off, 0.99 = very smooth)
     pub smoothing: f64,
+    /// Auto-rotate mode
+    auto_rotate: bool,
+    /// Metric tags used for rotation
+    rotate_items: Vec<String>,
+    /// Current index in the rotation list
+    rotate_index: usize,
+    /// Interval between rotation steps
+    rotate_interval: Duration,
+    /// Last auto-rotation time
+    last_rotate: Instant,
     /// Current mouse position in terminal coordinates
     mouse_pos: Option<(u16, u16)>,
     /// Chart plotting area from last draw (for mouse → data mapping)
@@ -99,7 +112,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(store: MultiStore, dir: PathBuf) -> Self {
+    pub fn new(store: MultiStore, dir: PathBuf, auto_rotate: bool, rotate_interval: Duration) -> Self {
         let multi_exp = store.experiments.len() > 1;
         let exp_names: Vec<String> = store.experiment_names().iter().map(|s| s.to_string()).collect();
         // Select all experiments by default
@@ -127,7 +140,9 @@ impl App {
             Panel::Metrics
         };
 
-        Self {
+        let rotate_interval = Self::clamp_rotate_interval(rotate_interval);
+
+        let mut app = Self {
             store,
             dir,
             panel,
@@ -146,6 +161,11 @@ impl App {
             last_reload: Instant::now(),
             wall_time_axis: false,
             smoothing: 0.0,
+            auto_rotate,
+            rotate_items: Vec::new(),
+            rotate_index: 0,
+            rotate_interval,
+            last_rotate: Instant::now(),
             mouse_pos: None,
             chart_area: Rect::default(),
             chart_bounds: [0.0; 4],
@@ -154,7 +174,14 @@ impl App {
             drag_start: None,
             last_click: Instant::now(),
             pan_start: None,
+        };
+
+        if app.auto_rotate {
+            app.populate_rotate_items();
+            app.last_rotate = Instant::now();
         }
+
+        app
     }
 
     /// Build the metric tree display list from tags and collapsed state.
@@ -205,6 +232,82 @@ impl App {
         }
     }
 
+    fn clamp_rotate_interval(interval: Duration) -> Duration {
+        let secs = interval.as_secs().clamp(ROTATE_MIN_SECS, ROTATE_MAX_SECS);
+        Duration::from_secs(secs)
+    }
+
+    fn populate_rotate_items(&mut self) {
+        let selected: Vec<String> = self
+            .visible_tags
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.metric_selected.get(*i).copied().unwrap_or(false))
+            .map(|(_, t)| t.clone())
+            .collect();
+        if selected.is_empty() {
+            self.rotate_items = self.store.all_tags();
+        } else {
+            self.rotate_items = selected;
+        }
+        self.rotate_index = 0;
+    }
+
+    fn refresh_rotate_items(&mut self) {
+        if self.rotate_items.is_empty() {
+            return;
+        }
+        let available: HashSet<String> = self.store.all_tags().into_iter().collect();
+        self.rotate_items.retain(|tag| available.contains(tag));
+        if self.rotate_index >= self.rotate_items.len() {
+            self.rotate_index = 0;
+        }
+    }
+
+    fn toggle_auto_rotate(&mut self) {
+        self.auto_rotate = !self.auto_rotate;
+        if self.auto_rotate {
+            self.populate_rotate_items();
+            self.last_rotate = Instant::now();
+        }
+    }
+
+    fn adjust_rotate_interval(&mut self, delta: i64) {
+        let secs = self.rotate_interval.as_secs() as i64 + delta;
+        let clamped = secs.clamp(ROTATE_MIN_SECS as i64, ROTATE_MAX_SECS as i64);
+        self.rotate_interval = Duration::from_secs(clamped as u64);
+    }
+
+    fn advance_rotate_if_needed(&mut self) {
+        if !self.auto_rotate || self.rotate_items.is_empty() {
+            return;
+        }
+        if self.last_rotate.elapsed() >= self.rotate_interval {
+            self.rotate_index = (self.rotate_index + 1) % self.rotate_items.len();
+            self.last_rotate = Instant::now();
+        }
+    }
+
+    fn rotate_remaining(&self) -> Duration {
+        if !self.auto_rotate {
+            return Duration::from_secs(0);
+        }
+        let elapsed = self.last_rotate.elapsed();
+        if elapsed >= self.rotate_interval {
+            Duration::from_secs(0)
+        } else {
+            self.rotate_interval - elapsed
+        }
+    }
+
+    fn auto_status_string(&self) -> Option<String> {
+        if !self.auto_rotate {
+            return None;
+        }
+        let remaining = self.rotate_remaining().as_secs_f64();
+        Some(format!("[AUTO {:.1}s]", remaining))
+    }
+
     fn update_visible_tags(&mut self) {
         let all_tags = self.store.all_tags();
         if self.filter.is_empty() {
@@ -252,6 +355,16 @@ impl App {
             .collect()
     }
 
+    fn active_metric_tags(&self) -> Vec<&str> {
+        if self.auto_rotate {
+            if let Some(tag) = self.rotate_items.get(self.rotate_index) {
+                return vec![tag.as_str()];
+            }
+            return Vec::new();
+        }
+        self.selected_metric_tags()
+    }
+
     /// Map terminal coordinates to data coordinates using last frame's chart geometry.
     fn terminal_to_data(&self, tx: u16, ty: u16) -> Option<(f64, f64)> {
         let area = self.chart_area;
@@ -293,6 +406,7 @@ impl App {
         // Grow/shrink exp_selected
         self.exp_selected.resize(self.exp_names.len(), false);
         self.update_visible_tags();
+        self.refresh_rotate_items();
         self.last_reload = Instant::now();
         Ok(())
     }
@@ -333,6 +447,7 @@ impl App {
             if self.last_reload.elapsed() > Duration::from_secs(30) {
                 let _ = self.reload();
             }
+            self.advance_rotate_if_needed();
             return Ok(true);
         }
 
@@ -408,6 +523,7 @@ impl App {
                 }
                 _ => {}
             }
+            self.advance_rotate_if_needed();
             return Ok(true);
         }
 
@@ -442,6 +558,7 @@ impl App {
                     }
                     _ => {}
                 }
+                self.advance_rotate_if_needed();
                 return Ok(true);
             }
             // Navigation keys fall through to the main handler below
@@ -471,6 +588,15 @@ impl App {
             }
             KeyCode::Char('r') => {
                 let _ = self.reload();
+            }
+            KeyCode::Char('R') => {
+                self.toggle_auto_rotate();
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.adjust_rotate_interval(1);
+            }
+            KeyCode::Char('-') => {
+                self.adjust_rotate_interval(-1);
             }
             KeyCode::Char('t') => {
                 self.wall_time_axis = !self.wall_time_axis;
@@ -553,6 +679,7 @@ impl App {
             }
             _ => {}
         }
+        self.advance_rotate_if_needed();
         Ok(true)
     }
 
@@ -609,13 +736,19 @@ impl App {
         }
 
         // Status bar
+        let auto_status = self.auto_status_string();
         let status = if self.filter_mode {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(" FILTER: ", Style::default().fg(Color::Black).bg(Color::Yellow)),
                 Span::raw(&self.filter),
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
                 Span::raw("  (Enter/Esc to confirm)"),
-            ])
+            ];
+            if let Some(auto) = auto_status {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(auto, Style::default().fg(Color::Yellow)));
+            }
+            Line::from(spans)
         } else {
             let log_indicator = if self.log_scale { " LOG" } else { "" };
             let mut spans = vec![
@@ -637,6 +770,10 @@ impl App {
                 Span::raw(format!(" log{log_indicator} ")),
                 Span::styled("r", Style::default().fg(Color::Cyan)),
                 Span::raw(" reload "),
+                Span::styled("R", Style::default().fg(Color::Cyan)),
+                Span::raw(" auto "),
+                Span::styled("+/-", Style::default().fg(Color::Cyan)),
+                Span::raw(" interval "),
                 Span::styled("a", Style::default().fg(Color::Cyan)),
                 Span::raw(" all "),
                 Span::styled("t", Style::default().fg(Color::Cyan)),
@@ -648,6 +785,10 @@ impl App {
                     " smooth ".to_string()
                 }),
             ]);
+            if let Some(auto) = auto_status {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(auto, Style::default().fg(Color::Yellow)));
+            }
             Line::from(spans)
         };
         frame.render_widget(Paragraph::new(status), outer[2]);
@@ -764,7 +905,7 @@ impl App {
 
     fn draw_chart(&mut self, frame: &mut Frame, area: Rect) {
         let sel_exps = self.selected_exp_indices();
-        let sel_tags = self.selected_metric_tags();
+        let sel_tags = self.active_metric_tags();
 
         if sel_exps.is_empty() || sel_tags.is_empty() {
             let hint = if sel_exps.is_empty() {
