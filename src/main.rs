@@ -104,10 +104,17 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    // Initial draw
+    terminal.draw(|f| app.draw(f))?;
+    app.needs_redraw = false;
+
     loop {
-        terminal.draw(|f| app.draw(f))?;
         if !app.handle_event()? {
             break;
+        }
+        if app.needs_redraw {
+            terminal.draw(|f| app.draw(f))?;
+            app.needs_redraw = false;
         }
     }
     Ok(())

@@ -96,6 +96,14 @@ pub struct App {
     last_click: Instant,
     /// Pan state: (terminal start pos, zoom bounds at pan start)
     pan_start: Option<((u16, u16), [f64; 4])>,
+
+    // -- Auto-rotate mode --
+    pub auto_rotate: bool,
+    pub rotate_interval: Duration,
+    pub last_rotate: Instant,
+    pub rotate_list: Vec<String>,
+    pub rotate_idx: usize,
+    pub needs_redraw: bool,
 }
 
 impl App {
@@ -154,6 +162,12 @@ impl App {
             drag_start: None,
             last_click: Instant::now(),
             pan_start: None,
+            auto_rotate: false,
+            rotate_interval: Duration::from_secs(5),
+            last_rotate: Instant::now(),
+            rotate_list: Vec::new(),
+            rotate_idx: 0,
+            needs_redraw: true,
         }
     }
 
@@ -293,7 +307,95 @@ impl App {
         // Grow/shrink exp_selected
         self.exp_selected.resize(self.exp_names.len(), false);
         self.update_visible_tags();
+        self.cleanup_rotation_list();
         self.last_reload = Instant::now();
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    pub fn toggle_auto_rotate(&mut self) {
+        self.auto_rotate = !self.auto_rotate;
+        if self.auto_rotate {
+            // Build rotation list from currently selected metrics
+            let mut list: Vec<String> = self.selected_metric_tags().iter().map(|s| s.to_string()).collect();
+            if list.is_empty() {
+                // Fallback to visible tags
+                list = self.visible_tags.clone();
+            }
+            if list.is_empty() {
+                // If still empty, cannot auto-rotate
+                self.auto_rotate = false;
+            } else {
+                self.rotate_list = list;
+                self.rotate_idx = 0;
+                self.last_rotate = Instant::now();
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    pub fn cleanup_rotation_list(&mut self) {
+        if !self.auto_rotate {
+            return;
+        }
+        let all_tags: HashSet<String> = self.store.all_tags().into_iter().collect();
+        let current_tag = self.rotate_list.get(self.rotate_idx).cloned();
+        
+        self.rotate_list.retain(|tag| all_tags.contains(tag));
+        
+        if self.rotate_list.is_empty() {
+            self.auto_rotate = false;
+        } else {
+            if let Some(tag) = current_tag {
+                if let Some(new_idx) = self.rotate_list.iter().position(|t| t == &tag) {
+                    self.rotate_idx = new_idx;
+                } else {
+                    self.rotate_idx = self.rotate_idx.min(self.rotate_list.len() - 1);
+                }
+            } else {
+                self.rotate_idx = self.rotate_idx.min(self.rotate_list.len() - 1);
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    pub fn compute_poll_timeout(&self) -> Duration {
+        let now = Instant::now();
+        
+        // Time until next auto-reload (every 30 seconds)
+        let reload_elapsed = now.duration_since(self.last_reload);
+        let reload_timeout = Duration::from_secs(30).saturating_sub(reload_elapsed);
+        
+        let mut timeout = reload_timeout;
+        
+        // Time until next rotation (if active)
+        if self.auto_rotate && !self.rotate_list.is_empty() {
+            let rotate_elapsed = now.duration_since(self.last_rotate);
+            let rotate_timeout = self.rotate_interval.saturating_sub(rotate_elapsed);
+            timeout = timeout.min(rotate_timeout);
+        }
+        
+        // Clamp to min 10ms and max 1 second to keep responsive
+        timeout.max(Duration::from_millis(10)).min(Duration::from_secs(1))
+    }
+
+    pub fn tick(&mut self) -> Result<()> {
+        let now = Instant::now();
+        
+        // Check rotation timer
+        if self.auto_rotate && !self.rotate_list.is_empty() {
+            if now.duration_since(self.last_rotate) >= self.rotate_interval {
+                self.rotate_idx = (self.rotate_idx + 1) % self.rotate_list.len();
+                self.last_rotate = now;
+                self.needs_redraw = true;
+            }
+        }
+        
+        // Check reload timer
+        if now.duration_since(self.last_reload) >= Duration::from_secs(30) {
+            let _ = self.reload();
+        }
+        
         Ok(())
     }
 
@@ -329,14 +431,16 @@ impl App {
 
     /// Returns false when the app should exit.
     pub fn handle_event(&mut self) -> Result<bool> {
-        if !event::poll(Duration::from_millis(250))? {
-            if self.last_reload.elapsed() > Duration::from_secs(30) {
-                let _ = self.reload();
-            }
+        self.tick()?;
+
+        let poll_timeout = self.compute_poll_timeout();
+        if !event::poll(poll_timeout)? {
+            self.tick()?;
             return Ok(true);
         }
 
         let ev = event::read()?;
+        self.needs_redraw = true;
 
         // Handle mouse events
         if let Event::Mouse(mouse) = &ev {
@@ -422,6 +526,69 @@ impl App {
             return Ok(false);
         }
 
+        if self.auto_rotate {
+            match key.code {
+                KeyCode::Char('R') => {
+                    self.toggle_auto_rotate();
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    let secs = self.rotate_interval.as_secs().min(119) + 1;
+                    self.rotate_interval = Duration::from_secs(secs);
+                    self.needs_redraw = true;
+                }
+                KeyCode::Char('-') => {
+                    let secs = self.rotate_interval.as_secs().max(2) - 1;
+                    self.rotate_interval = Duration::from_secs(secs);
+                    self.needs_redraw = true;
+                }
+                KeyCode::Char('[') => {
+                    if !self.rotate_list.is_empty() {
+                        if self.rotate_idx == 0 {
+                            self.rotate_idx = self.rotate_list.len() - 1;
+                        } else {
+                            self.rotate_idx -= 1;
+                        }
+                        self.last_rotate = Instant::now();
+                        self.needs_redraw = true;
+                    }
+                }
+                KeyCode::Char(']') => {
+                    if !self.rotate_list.is_empty() {
+                        self.rotate_idx = (self.rotate_idx + 1) % self.rotate_list.len();
+                        self.last_rotate = Instant::now();
+                        self.needs_redraw = true;
+                    }
+                }
+                KeyCode::Char('q') => return Ok(false),
+                KeyCode::Char('l') => {
+                    self.log_scale = !self.log_scale;
+                    self.needs_redraw = true;
+                }
+                KeyCode::Char('r') => {
+                    let _ = self.reload();
+                }
+                KeyCode::Char('t') => {
+                    self.wall_time_axis = !self.wall_time_axis;
+                    self.needs_redraw = true;
+                }
+                KeyCode::Char('s') => {
+                    self.smoothing = (self.smoothing - 0.1).max(0.0);
+                    if self.smoothing < 0.05 { self.smoothing = 0.0; }
+                    self.needs_redraw = true;
+                }
+                KeyCode::Char('S') => {
+                    if self.smoothing < 0.05 {
+                        self.smoothing = 0.6;
+                    } else {
+                        self.smoothing = (self.smoothing + 0.1).min(0.99);
+                    }
+                    self.needs_redraw = true;
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         if self.filter_mode {
             let is_nav = matches!(
                 key.code,
@@ -449,6 +616,9 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => return Ok(false),
+            KeyCode::Char('R') => {
+                self.toggle_auto_rotate();
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 if self.multi_exp {
                     self.panel = match self.panel {
@@ -583,7 +753,9 @@ impl App {
         frame.render_widget(Paragraph::new(title), outer[0]);
 
         // Main layout
-        if self.multi_exp {
+        if self.auto_rotate {
+            self.draw_chart(frame, outer[1]);
+        } else if self.multi_exp {
             let main = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(36), Constraint::Min(40)])
@@ -616,6 +788,38 @@ impl App {
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
                 Span::raw("  (Enter/Esc to confirm)"),
             ])
+        } else if self.auto_rotate {
+            let metric_name = self.rotate_list.get(self.rotate_idx).map(|s| s.as_str()).unwrap_or("");
+            let pos_indicator = format!("({}/{})", self.rotate_idx + 1, self.rotate_list.len());
+            let log_indicator = if self.log_scale { " LOG" } else { "" };
+            let spans = vec![
+                Span::styled("[AUTO] ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}s ", self.rotate_interval.as_secs()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("| "),
+                Span::styled(format!("{} ", pos_indicator), Style::default().fg(Color::Cyan)),
+                Span::styled(metric_name.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::raw(" | "),
+                Span::styled("R", Style::default().fg(Color::Cyan)),
+                Span::raw(" stop "),
+                Span::styled("[", Style::default().fg(Color::Cyan)),
+                Span::raw(" prev "),
+                Span::styled("]", Style::default().fg(Color::Cyan)),
+                Span::raw(" next "),
+                Span::styled("+/-", Style::default().fg(Color::Cyan)),
+                Span::raw(" interval "),
+                Span::styled("l", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" log{log_indicator} ")),
+                Span::styled("s/S", Style::default().fg(Color::Cyan)),
+                Span::raw(if self.smoothing > 0.0 {
+                    format!(" smooth {:.0}% ", self.smoothing * 100.0)
+                } else {
+                    " smooth ".to_string()
+                }),
+                Span::raw(" | "),
+                Span::styled("q", Style::default().fg(Color::Cyan)),
+                Span::raw(" quit"),
+            ];
+            Line::from(spans)
         } else {
             let log_indicator = if self.log_scale { " LOG" } else { "" };
             let mut spans = vec![
@@ -637,6 +841,8 @@ impl App {
                 Span::raw(format!(" log{log_indicator} ")),
                 Span::styled("r", Style::default().fg(Color::Cyan)),
                 Span::raw(" reload "),
+                Span::styled("R", Style::default().fg(Color::Cyan)),
+                Span::raw(" rotate "),
                 Span::styled("a", Style::default().fg(Color::Cyan)),
                 Span::raw(" all "),
                 Span::styled("t", Style::default().fg(Color::Cyan)),
@@ -764,7 +970,15 @@ impl App {
 
     fn draw_chart(&mut self, frame: &mut Frame, area: Rect) {
         let sel_exps = self.selected_exp_indices();
-        let sel_tags = self.selected_metric_tags();
+        let sel_tags = if self.auto_rotate {
+            if let Some(tag) = self.rotate_list.get(self.rotate_idx) {
+                vec![tag.as_str()]
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.selected_metric_tags()
+        };
 
         if sel_exps.is_empty() || sel_tags.is_empty() {
             let hint = if sel_exps.is_empty() {
@@ -944,8 +1158,18 @@ impl App {
         self.chart_bounds = [x_min, x_max, y_min, y_max];
         self.y_label_width = y_lw;
 
+        let chart_title = if self.auto_rotate {
+            if let Some(tag) = self.rotate_list.get(self.rotate_idx) {
+                format!(" Chart: {tag} ")
+            } else {
+                " Chart ".to_string()
+            }
+        } else {
+            " Chart ".to_string()
+        };
+
         let chart = Chart::new(datasets)
-            .block(Block::default().borders(Borders::ALL).title(" Chart "))
+            .block(Block::default().borders(Borders::ALL).title(chart_title))
             .x_axis(
                 Axis::default()
                     .title(x_title)
