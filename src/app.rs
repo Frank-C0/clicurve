@@ -104,10 +104,11 @@ pub struct App {
     pub rotate_list: Vec<String>,
     pub rotate_idx: usize,
     pub needs_redraw: bool,
+    pub reload_interval: Duration,
 }
 
 impl App {
-    pub fn new(store: MultiStore, dir: PathBuf) -> Self {
+    pub fn new(store: MultiStore, dir: PathBuf, reload_interval: Duration) -> Self {
         let multi_exp = store.experiments.len() > 1;
         let exp_names: Vec<String> = store.experiment_names().iter().map(|s| s.to_string()).collect();
         // Select all experiments by default
@@ -168,6 +169,7 @@ impl App {
             rotate_list: Vec::new(),
             rotate_idx: 0,
             needs_redraw: true,
+            reload_interval,
         }
     }
 
@@ -362,9 +364,9 @@ impl App {
     pub fn compute_poll_timeout(&self) -> Duration {
         let now = Instant::now();
         
-        // Time until next auto-reload (every 30 seconds)
+        // Time until next auto-reload
         let reload_elapsed = now.duration_since(self.last_reload);
-        let reload_timeout = Duration::from_secs(30).saturating_sub(reload_elapsed);
+        let reload_timeout = self.reload_interval.saturating_sub(reload_elapsed);
         
         let mut timeout = reload_timeout;
         
@@ -392,7 +394,7 @@ impl App {
         }
         
         // Check reload timer
-        if now.duration_since(self.last_reload) >= Duration::from_secs(30) {
+        if now.duration_since(self.last_reload) >= self.reload_interval {
             let _ = self.reload();
         }
         
@@ -1160,7 +1162,28 @@ impl App {
 
         let chart_title = if self.auto_rotate {
             if let Some(tag) = self.rotate_list.get(self.rotate_idx) {
-                format!(" Chart: {tag} ")
+                let mut title_suffix = String::new();
+                for &exp_idx in &sel_exps {
+                    if let Some((exp_name, _, store)) = self.store.experiments.get(exp_idx) {
+                        if let Some(points) = store.metrics.get(tag) {
+                            if let Some(last_pt) = points.last() {
+                                if !title_suffix.is_empty() {
+                                    title_suffix.push_str(" | ");
+                                }
+                                if sel_exps.len() > 1 {
+                                    title_suffix.push_str(&format!("{}: {}", exp_name, format_number(last_pt.value as f64)));
+                                } else {
+                                    title_suffix.push_str(&format!("last = {}", format_number(last_pt.value as f64)));
+                                }
+                            }
+                        }
+                    }
+                }
+                if title_suffix.is_empty() {
+                    format!(" Chart: {tag} ")
+                } else {
+                    format!(" Chart: {tag} ({title_suffix}) ")
+                }
             } else {
                 " Chart ".to_string()
             }

@@ -32,6 +32,10 @@ struct Cli {
     /// List available experiments and metrics, then exit (no TUI)
     #[arg(long)]
     list: bool,
+
+    /// Reload interval in seconds (default: 30, minimum: 10)
+    #[arg(long, default_value_t = 30)]
+    reload_interval: u64,
 }
 
 fn main() -> Result<()> {
@@ -72,7 +76,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut app = App::new(store, dir);
+    let reload_secs = cli.reload_interval.max(10);
+    let mut app = App::new(store, dir, std::time::Duration::from_secs(reload_secs));
     if let Some(f) = cli.filter {
         app.filter = f;
         app.filter_mode = false;
