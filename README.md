@@ -5,6 +5,12 @@ No browser, no port forwarding, no fuss — just point it at your experiment log
 
 Built in Rust. Reads TFEvent files directly (protobuf parsing, no Python dependency).
 
+> **Note:** This is a personal fork of clicurve focused on **continuous terminal monitoring** rather than interactive exploration.
+>
+> It keeps the original TensorBoard viewer behavior, but adds dashboard-oriented features such as automatic metric rotation, hidden side panels to maximize chart space, live last-value labels in the chart title, and smoother background reloads for unattended use.
+>
+> The extra code in this fork is provided as-is and can be reused or adapted freely if it is useful for other setups.
+
 https://github.com/user-attachments/assets/8f9001a9-5178-4c35-b21d-76ba73adf313
 
 ## Install
